@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 from dataclasses import dataclass
 
 import torch
@@ -15,6 +16,7 @@ class GPTConfig:
 
 class MLP(nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
@@ -57,9 +59,10 @@ class CasualSelfAttention(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CasualSelfAttention(config)
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor):
@@ -79,44 +82,78 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
 
+    def forward(self, x: torch.Tensor):
+        # x is of shape (B, T)
+        B, T = x.size()
+        assert T <= self.config.block_size, f"input sequence length {T} is greater than block size {self.config.block_size}"
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        pos_emb = self.transformer.wpe(pos) # positional embeddings (T, n_embd)
+        tok_emb = self.transformer.wte(x)   # token embeddings (B, T, n_embd)
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)            # (B, T, vocab_size)
+        return logits
+
     @classmethod
-    def from_pretrained(cls, model_type: str):
-        '''
-        Load a pretrained model from Huggingface
-        '''
-        assert model_type in ['gpt2', 'gpt2-medium', 'gpt2-large'], f"model_type must be one of ['gpt2', 'gpt2-medium', 'gpt2-large'], but got {model_type}"
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
-        print(f"Loading pretrained model {model_type} from Huggingface")
+        print("loading weights from pretrained gpt: %s" % model_type)
 
+        # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2': GPTConfig(n_layer=12, n_head=12, n_embd=768),
-            'gpt2-medium': GPTConfig(n_layer=24, n_head=16, n_embd=1024),
-            'gpt2-large': GPTConfig(n_layer=36, n_head=20, n_embd=1280),
-            'gpt2-xl': GPTConfig(n_layer=48, n_head=25, n_embd=1600)
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
-        model = cls(config)
-        state_dict = model.state_dict()
-        state_dict_keys = state_dict.keys()
-        state_dict_keys = [k for k in state_dict_keys if not k.endswith('.attn.bias')] # remove bias for attention layers
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith(('.attn.bias', '.attn.mask'))] # discard this mask / buffer, not a param
 
+        # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        state_dict_hf = model_hf.state_dict()
-        state_dict_hf_keys = state_dict_hf.keys()
-        state_dict_hf_keys = [k for k in state_dict_hf_keys if not k.endswith('.attn.masked_bias')]
-        state_dict_hf_keys = [k for k in state_dict_hf_keys if not k.endswith('.attn.bias')]
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(('.attn.masked_bias', '.attn.bias'))] # ignore these, just a buffer
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        assert len(state_dict_hf_keys) == len(state_dict_keys), f"mismatched keys: {len(state_dict_hf_keys)} != {len(state_dict_keys)}"
-        for k in state_dict_hf_keys:
-            if any(k.endswith(t) for t in transposed):
-                assert state_dict_hf[k].shape == state_dict[k].T.shape, f"mismatched shape: {state_dict_hf[k].shape} != {state_dict[k].T.shape}"
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        if len(sd_keys_hf) != len(sd_keys):
+            print("WARNING: number of parameters in source and target GPT models differ")
+            print("source:", len(sd_keys_hf), "target:", len(sd_keys))
+            source_set = set(sd_keys_hf)
+            target_set = set(sd_keys)
+            intersection = source_set & target_set
+            source_missing = target_set - intersection
+            target_missing = source_set - intersection
+            print("missing in source:", source_missing)
+            print("missing in target:", target_missing)
+            raise ValueError("could not align source and target model parameters")
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
-                    state_dict[k].copy_(state_dict_hf[k].T)
+                    sd[k].copy_(sd_hf[k].t())
             else:
-                assert state_dict_hf[k].shape == state_dict[k].shape, f"mismatched shape: {state_dict_hf[k].shape} != {state_dict[k].shape}"
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
-                    state_dict[k].copy_(state_dict_hf[k])
+                    sd[k].copy_(sd_hf[k])
         return model
+
+
+if __name__ == '__main__':
+    model = GPT.from_pretrained('gpt2')
+    print(model)
