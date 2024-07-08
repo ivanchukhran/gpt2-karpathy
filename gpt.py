@@ -155,5 +155,35 @@ class GPT(nn.Module):
 
 
 if __name__ == '__main__':
+    num_return_sequences = 5
+    max_length = 30
+
     model = GPT.from_pretrained('gpt2')
-    print(model)
+    model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    print(f"loaded model to {device}")
+
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to(device)
+
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    with torch.no_grad():
+        while x.size() < max_length:
+            logits = model(x)
+            # take the logits at the last position
+            logits = logits[:, -1, :]
+            # get probabilities
+            probs = F.softmax(logits, dim=-1)
+            # do top-k sampling of 50 (hf default)
+            # topk_probs here becomes (5, 50), topk_indices becomes (5, 50)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+            # select a token from the top-k probabilities
+            x = torch.multinomial(topk_probs, num_samples=1)
